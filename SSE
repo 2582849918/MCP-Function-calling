@@ -1,0 +1,363 @@
+@dataclass
+class SubtitleConfig:
+    """存储字幕处理配置的数据类"""
+    input_path: str = ""
+    output_path: str = ""
+    original_language: str = 'zh-CN'
+    target_language: str = 'en'
+    subtitles_path_original: Optional[str] = None
+    subtitles_path_translated: Optional[str] = None
+    need_subtitles_original: bool = True
+    need_subtitles_translated: bool = False
+    
+    position: str = 'bottom'
+    font_size: int = 32
+    style_type:str = SubtitleStyleType.CYAN_HIGHLIGHT_BOLD
+
+
+def add_subtitle(
+    config:SubtitleConfig, 
+    callback: Optional[Callable[[int], None]] = None
+)-> Tuple[int, str]:
+    """
+    对外提供给视频添加字幕的接口
+    返回错误码
+    """
+    return VideoSubtitleAdd.add_subtitle(
+        config=config, 
+        callback=callback
+    )
+	
+video_subtitle_add.py
+import os
+import re
+import numpy as np
+from moviepy.video.VideoClip import ImageClip
+from moviepy import VideoFileClip, CompositeVideoClip
+from pysubs2 import SSAFile
+from PIL import Image, ImageDraw, ImageFont
+from typing import List, Tuple, Optional, Callable
+
+# ----------------- 关键依赖 -----------------
+from ..utils.subtitle_style  import SubtitleStyleType,STYLE_LIBRARY, SubtitleStyle
+# -------------------------------------------
+
+from ..api.error_codes import ErrorCodes
+from ..utils import utils,llm,video_utils
+from ..utils.subtitle_utils import SubtitleConfig,remove_punctuation_from_end
+class VideoSubtitleAdd:
+    _singleton = None
+    def __init__(self, config: SubtitleConfig, callback: Optional[Callable[[int], None]] = None):
+        self.config = config
+        self.callback = callback
+        self._validate_paths()
+        self.loaded_fonts = {}
+    @classmethod
+    def _get_instance(cls, config: SubtitleConfig,callback: Optional[Callable[[int], None]] = None):
+        if cls._singleton is None:
+            cls._singleton = cls(config, callback)
+        else:
+            cls._singleton.config = config
+            cls._singleton.callback = callback
+            cls._singleton.loaded_fonts = {}
+        return cls._singleton
+    
+    @staticmethod
+    def add_subtitle(config: SubtitleConfig, callback: Optional[Callable[[int], None]] = None) -> Tuple[int, str]:
+        try:
+            inst = VideoSubtitleAdd._get_instance(config,callback)
+            return inst._add_subtitle()
+        except (ValueError, FileNotFoundError) as e:
+            msg = f"初始化失败: {e}"
+            utils.print2(msg)
+            if "字幕路径缺失" in str(e):
+                return ErrorCodes.VIDEO_ORIGINAL_SUBTITLE_MISSING[0], msg
+            if "字体文件" in str(e):
+                return ErrorCodes.VIDEO_FONT_NOT_FOUND[0], msg
+            return ErrorCodes.INVALID_INPUT[0], msg
+        
+    def _validate_paths(self):
+        if self.config.input_path and not os.path.exists(self.config.input_path):
+            raise FileNotFoundError(f"输入文件未找到: {self.config.input_path}")
+        
+    def _load_font(self, font_name: str, font_size: int) -> ImageFont.FreeTypeFont:
+        font_key = f"{font_name}_{font_size}"
+        if font_key in self.loaded_fonts:
+            return self.loaded_fonts[font_key]
+        project_root = utils.get_project_root()
+        if project_root is None:
+            raise FileNotFoundError("无法找到项目根目录。")
+        fonts_dir = os.path.join(project_root, 'res', 'fonts')
+        font_path = os.path.join(fonts_dir, font_name)
+        if not os.path.exists(font_path):
+            utils.print2(f"字体文件不存在: {font_path}")
+            raise FileNotFoundError(f"字体文件不存在: {font_name}")
+        utils.print2(f"加载字体: {font_path}，字号: {font_size}")
+        font = ImageFont.truetype(font_path, font_size)
+        self.loaded_fonts[font_key] = font
+        return font
+
+    def _add_subtitle(self) -> Tuple[int, str]:
+        utils.print2("开始处理视频...")
+        video = None
+        final_video = None
+        try:
+            if self.callback: self.callback(5)
+            video = VideoFileClip(self.config.input_path)
+            # process_subtitles 内部已重构，会调用 _create_subtitle_clips
+            subtitle_clips = self.process_subtitles(video, str(self.config.style_type))
+            
+            utils.print2("合成视频剪辑...")
+            final_video = CompositeVideoClip([video] + subtitle_clips, size=video.size) # 合成方式稍作调整
+            if self.callback: self.callback(85)
+            # 使用新的通用写入函数 ---
+            # 删除了 codec, audio_codec, audio, fps, threads, preset, ffmpeg_params 等参数
+            # 新函数会处理这些，并提供更高质量的默认值
+            write_code = video_utils.write_video_with_post_processing(
+                final_video,
+                self.config.output_path
+            )
+
+            if write_code != ErrorCodes.SUCCESS:
+                # 如果写入失败，返回一个通用的处理错误
+                msg = f"视频处理完成，但写入文件失败!文件:{self.config.output_path},错误码:{write_code}"
+                utils.print2(msg)
+                return ErrorCodes.VIDEO_SUBTITLE_PROCESSING_ERROR[0], msg
+            utils.print2("视频处理完成。")
+            return ErrorCodes.SUCCESS
+        except Exception as e:
+            msg = f"处理视频时出错: {e}"
+            utils.print2(msg)
+            if isinstance(e, FileNotFoundError):
+                return ErrorCodes.VIDEO_FONT_NOT_FOUND[0], msg
+            return ErrorCodes.VIDEO_SUBTITLE_PROCESSING_ERROR[0], msg
+        finally:
+            if video: video.close()
+            if final_video: final_video.close()
+            if self.callback: self.callback(100)
+
+    def clean_subtitle(self, subtitle: str) -> str:
+        return re.sub(r'^Speaker-\d+:\s*', '', subtitle)
+
+    def process_subtitles(self, video: VideoFileClip, style_type_str: str) -> List[ImageClip]:
+        """
+        【重构】此方法现在作为文件读取的入口，并调用核心的剪辑生成方法。
+        """
+        utils.print2(f"开始从文件处理字幕，样式: {style_type_str}")
+
+        original_srt_content, translated_srt_content = "", ""
+        if self.config.need_subtitles_original and self.config.subtitles_path_original:
+            try:
+                with open(str(self.config.subtitles_path_original), 'r', encoding='utf-8') as f: original_srt_content = f.read()
+            except Exception as e: utils.print2(f"读取原始字幕文件失败: {e}")
+        if self.config.need_subtitles_translated and self.config.subtitles_path_translated:
+            try:
+                with open(str(self.config.subtitles_path_translated), 'r', encoding='utf-8') as f: translated_srt_content = f.read()
+            except Exception as e: utils.print2(f"读取翻译字幕文件失败: {e}")
+        
+        # 调用核心方法
+        return self._create_subtitle_clips(video, original_srt_content, translated_srt_content)
+
+    def generate_clips_from_srt_content(self, video: VideoFileClip, srt_content: str) -> List[ImageClip]:
+        """
+        【重构】此方法现在直接调用核心的剪辑生成方法，实现了逻辑归一。
+        """
+        utils.print2("开始根据SRT内容生成字幕剪辑...")
+        # 直接调用核心方法，不处理翻译字幕
+        return self._create_subtitle_clips(video, original_srt_content=srt_content)
+    
+    def _create_subtitle_clips(self, video: VideoFileClip, original_srt_content: str, translated_srt_content: str = "") -> List[ImageClip]:
+        """
+        所有字幕剪辑生成的统一逻辑入口。
+        """
+        video_w, video_h = video.size
+        clips = []
+        style_enum_key = SubtitleStyleType(str(self.config.style_type))
+        selected_style = STYLE_LIBRARY.get(style_enum_key, STYLE_LIBRARY[SubtitleStyleType.DEFAULT])
+
+        if self.config.font_size > 0:
+            new_font_size_ratio = self.config.font_size / video_h
+            selected_style.font_size_ratio = new_font_size_ratio
+            if selected_style.highlight_font_size_ratio is not None:
+                selected_style.highlight_font_size_ratio = new_font_size_ratio * 1.1
+            utils.print2(f"已应用字幕样式 '{self.config.style_type}' 的字号为: {self.config.font_size}px")
+
+        subs_original, subs_translated = SSAFile(), SSAFile()
+        if original_srt_content:
+            try: subs_original = SSAFile.from_string(original_srt_content)
+            except Exception as e: utils.print2(f"解析原始字幕失败: {e}")
+        if translated_srt_content:
+            try: subs_translated = SSAFile.from_string(translated_srt_content)
+            except Exception as e: utils.print2(f"解析翻译字幕失败: {e}")
+
+        original_subtitles = [(e.start, e.end, self.clean_subtitle(e.plaintext)) for e in subs_original]
+        translated_subtitles = [(e.start, e.end, self.clean_subtitle(e.plaintext)) for e in subs_translated]
+        total_subs = max(len(original_subtitles), len(translated_subtitles))
+        if total_subs == 0: return clips
+        processed_subs = 0
+
+        if original_subtitles and translated_subtitles:
+            min_len = min(len(original_subtitles), len(translated_subtitles))
+            if len(original_subtitles) != len(translated_subtitles):
+                utils.print2(f"警告: 字幕数量不匹配, 将按最短的({min_len})处理。")
+            
+            for i in range(min_len):
+                (start_ms_orig, end_ms_orig, text_orig), (start_ms_trans, end_ms_trans, text_trans) = original_subtitles[i], translated_subtitles[i]
+                start_sec, end_sec = min(start_ms_orig, start_ms_trans) / 1000.0, max(end_ms_orig, end_ms_trans) / 1000.0
+                duration = end_sec - start_sec
+                if duration <= 0: continue
+                
+                img_array_orig, _, h_orig = self.draw_text_with_style(text_orig, video_w, video_h, selected_style)
+                img_array_trans, _, h_trans = self.draw_text_with_style(text_trans, video_w, video_h, selected_style)
+
+                combined_height = (h_orig if h_orig is not None else 0) + (h_trans if h_trans is not None else 0) + 10
+                bottom_margin = int(video_h * 0.05)
+
+                if self.config.position == 'top':
+                    y_pos_orig = int(video_h * 0.05)
+                elif self.config.position == 'center':
+                    y_pos_orig = (video_h - combined_height) // 2
+                else: # bottom (默认)
+                    y_pos_orig = video_h - bottom_margin - combined_height
+
+                y_pos_trans = y_pos_orig + (h_orig if h_orig is not None else 0) + 10
+
+                if img_array_orig is not None: clips.append(ImageClip(img_array_orig).with_duration(duration).with_position(('center', y_pos_orig)).with_start(start_sec))
+                if img_array_trans is not None: clips.append(ImageClip(img_array_trans).with_duration(duration).with_position(('center', y_pos_trans)).with_start(start_sec))
+                processed_subs += 1
+                if self.callback: self.callback(int(5 + 80 * processed_subs / total_subs))
+        else:
+            subtitles = original_subtitles or translated_subtitles
+            for (start_ms, end_ms, text) in subtitles:
+                text = remove_punctuation_from_end(text)
+                duration, start_sec = (end_ms - start_ms) / 1000.0, start_ms / 1000.0
+                if duration <= 0: continue
+                
+                img_array, _, total_height = self.draw_text_with_style(text, video_w, video_h, selected_style)
+
+                if img_array is not None:
+                    if self.config.position == 'bottom': y_pos = video_h - total_height - int(video_h * 0.05)
+                    elif self.config.position == 'top': y_pos = int(video_h * 0.05)
+                    else: y_pos = (video_h - total_height) // 2
+                    clips.append(ImageClip(img_array).with_duration(duration).with_position(('center', y_pos)).with_start(start_sec))
+                
+                processed_subs += 1
+                if self.callback: self.callback(int(5 + 80 * processed_subs / total_subs))
+        return clips
+
+    def contains_chinese(self, text: str) -> bool:
+        return bool(re.search(r'[\u4e00-\u9fff]', text))
+    
+    def wrap_text(self, text: str, font_base: ImageFont.FreeTypeFont, font_highlight: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+        segments, parts = [], re.split(r'(\*.*?\*)', text)
+        for part in parts:
+            if not part: continue
+            if part.startswith('*') and part.endswith('*'): segments.append((part[1:-1], True))
+            else: segments.append((part, False))
+        is_chinese_text = self.contains_chinese(text)
+        lines, current_line_width, current_line_segments = [], 0, []
+        for text_segment, is_highlight in segments:
+            font = font_highlight if is_highlight else font_base
+            units = text_segment.split(' ') if not is_chinese_text else list(text_segment)
+            for i, unit in enumerate(units):
+                if not unit: continue
+                unit_with_space = unit
+                if not is_chinese_text and i < len(units) - 1: unit_with_space += ' '
+                unit_width = font.getbbox(unit_with_space)[2]
+                if current_line_segments and current_line_width + font.getbbox(unit)[2] > max_width:
+                    lines.append(current_line_segments)
+                    current_line_segments, current_line_width = [], 0
+                current_line_segments.append((unit_with_space, is_highlight))
+                current_line_width += unit_width
+        if current_line_segments: lines.append(current_line_segments)
+        final_lines = []
+        for line_segments in lines:
+            line_str, in_highlight_block = "", False
+            for text_part, is_highlight_part in line_segments:
+                if is_highlight_part and not in_highlight_block: line_str += '*'; in_highlight_block = True
+                elif not is_highlight_part and in_highlight_block: line_str = line_str.rstrip() + '*'; in_highlight_block = False
+                line_str += text_part
+            if in_highlight_block: line_str = line_str.rstrip() + '*'
+            final_lines.append(line_str.strip())
+        return final_lines
+
+    def draw_text_with_style(self, text: str, video_w: int, video_h: int, style: SubtitleStyle) -> Tuple[Optional[np.ndarray], int, int]:
+        if not text.strip():
+            return None, 0, 0
+
+        base_font_size = int(video_h * style.font_size_ratio)
+        
+        has_highlight_style = (
+            style.highlight_font_size_ratio is not None and
+            style.highlight_color != style.base_color
+        )
+        
+        if has_highlight_style:
+            highlight_font_size = int(video_h * style.highlight_font_size_ratio)
+        else:
+            highlight_font_size = base_font_size
+
+        font_base = self._load_font(style.font_name, base_font_size)
+        font_highlight = self._load_font(style.font_name, highlight_font_size)
+
+        max_allowed_width = video_w - 40 
+        lines = self.wrap_text(text, font_base, font_highlight, max_allowed_width)
+        num_lines = len(lines)
+        if not lines: return None, 0, 0
+
+        line_metrics, max_line_width = [], 0
+        for line in lines:
+            use_highlight_metrics = '*' in line and has_highlight_style
+            
+            line_width = 0
+            for segment in re.split(r'(\*.*?\*)', line):
+                if not segment: continue
+                font = font_highlight if segment.startswith('*') and has_highlight_style else font_base
+                line_width += font.getbbox(segment.strip('*'))[2]
+                
+            max_line_width = max(max_line_width, line_width)
+            
+            main_font = font_highlight if use_highlight_metrics else font_base
+            ascent, descent = main_font.getmetrics()
+            line_metrics.append({'ascent': ascent, 'height': ascent + descent, 'width': line_width})
+
+        larger_font_size = max(base_font_size, highlight_font_size)
+        line_spacing = int(larger_font_size * style.line_spacing_ratio)
+        stroke_padding = max(1, int(larger_font_size * style.stroke_width_ratio)) if style.stroke_width_ratio > 0 else 0
+        
+        total_text_height = sum(m['height'] for m in line_metrics) + line_spacing * (num_lines - 1)
+        
+        canvas_width = max_line_width + (style.bg_padding_x + stroke_padding) * 2
+        canvas_height = total_text_height + (style.bg_padding_y + stroke_padding) * 2
+        
+        img = Image.new("RGBA", (int(canvas_width), int(canvas_height)), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        if style.bg_color:
+            draw.rectangle([0, 0, canvas_width, canvas_height], fill=style.bg_color)
+        
+        y_cursor = style.bg_padding_y + stroke_padding
+        for i, line in enumerate(lines):
+            metrics = line_metrics[i]
+            baseline = y_cursor + metrics['ascent']
+            x_cursor = (canvas_width - metrics['width']) / 2
+            
+            for segment in re.split(r'(\*.*?\*)', line):
+                if not segment: continue
+                is_highlight_segment = segment.startswith('*')
+                
+                clean_segment = segment.strip('*')
+                
+                use_this_segment_highlight = is_highlight_segment and has_highlight_style
+                
+                font = font_highlight if use_this_segment_highlight else font_base
+                color = style.highlight_color if use_this_segment_highlight else style.base_color
+                seg_stroke_width = int(font.size * style.stroke_width_ratio) if style.stroke_width_ratio > 0 else 0
+
+                draw.text((x_cursor, baseline), clean_segment, font=font, fill=color,
+                        stroke_width=seg_stroke_width, stroke_fill=style.stroke_color, anchor="ls")
+                x_cursor += font.getbbox(clean_segment)[2]
+
+            y_cursor += metrics['height'] + line_spacing
+            
+        return np.array(img), num_lines, int(canvas_height)
